@@ -1042,7 +1042,7 @@ readProcessWithOutputs outputNames l workDir cp = flip runContT return $ do
     -- Windows line endings are not converted so you have to filter out `'r` characters
   let loggingConduit = C.decodeUtf8  C..| C.lines C..| C.filterE (/= '\r')
         C..| C.map T.unpack C..| C.iterM (\msg -> l <& LogProcessOutput msg `WithSeverity` Debug) C..| C.sinkList
-  (ex, stdo, stde) <- liftIO $ sourceProcessWithStreams process mempty loggingConduit loggingConduit
+  (ex, stdo, stde) <- liftIO $ sourceProcessWithStreamsAndNice process mempty loggingConduit loggingConduit
 
   res <- forM output_files $ \(name,path) ->
           liftIO $ (name,) <$> readOutput path
@@ -1076,6 +1076,51 @@ removeFileIfExists :: FilePath -> IO ()
 removeFileIfExists f = do
   yes <- doesFileExist f
   when yes (removeFile f)
+
+-- | Given a @CreateProcess@, run the process
+-- and feed the provided @Producer@
+-- to the stdin @Sink@ of the process.
+-- Use the process outputs (stdout, stderr) as @Source@s
+-- and feed it to the provided @Consumer@s.
+-- Once the process has completed,
+-- return a tuple of the @ExitCode@ from the process
+-- and the results collected from the @Consumer@s.
+--
+-- If an exception is raised by any of the streams,
+-- the process is terminated.
+--
+-- IO is required because the streams are run concurrently
+-- using the <https://hackage.haskell.org/package/async async> package
+--
+-- Requires the threaded runtime.
+--
+-- From ``conduit-extra` until we have priority setting within `process` package
+-- (See ticket https://github.com/haskell/process/issues/281)
+sourceProcessWithStreamsAndNice
+  :: MonadUnliftIO m
+  => CreateProcess
+  -> ConduitT () ByteString m () -- ^stdin
+  -> ConduitT ByteString Void m a -- ^stdout
+  -> ConduitT ByteString Void m b -- ^stderr
+  -> m (ExitCode, a, b)
+sourceProcessWithStreamsAndNice cp producerStdin consumerStdout consumerStderr =
+  withUnliftIO $ \u -> do
+    (  (sinkStdin, closeStdin)
+     , (sourceStdout, closeStdout)
+     , (sourceStderr, closeStderr)
+     , sph) <- streamingProcess cp
+    -- Decrease process priority
+    sph `decreasePriorityBy` 10
+    (_, resStdout, resStderr) <-
+      runConcurrently (
+        (,,)
+        <$> Concurrently ((unliftIO u $ runConduit $ producerStdin .| sinkStdin) `finally` closeStdin)
+        <*> Concurrently (unliftIO u $ runConduit $ sourceStdout .| consumerStdout)
+        <*> Concurrently (unliftIO u $ runConduit $ sourceStderr .| consumerStderr))
+      `finally` (closeStdout >> closeStderr)
+      `onException` terminateStreamingProcess sph
+    ec <- waitForStreamingProcess sph
+    return (ec, resStdout, resStderr)
 
 makeCradleResult :: (ExitCode, [String], FilePath, [String]) -> [FilePath] -> CradleLoadResult ComponentOptions
 makeCradleResult (ex, err, componentDir, gopts) deps =
@@ -1118,6 +1163,60 @@ readProcessWithCwd' createdProcess stdin = do
       CradleError [] ExitSuccess $
         ["Couldn't execute " <> cmdString] <> prettyProcessEnv createdProcess
 
+-- | @readCreateProcessWithExitCode@ works exactly like 'readProcessWithExitCode' except that it
+-- lets you pass 'CreateProcess' giving better flexibility.
+--
+-- Note that @Handle@s provided for @std_in@, @std_out@, or @std_err@ via the CreateProcess
+-- record will be ignored.
+--
+-- This is a modified `process:System.Process.readCreateProcessWithExitCode`
+-- It decreases priority until we can have it in `CreateProcess`, see ticket:
+-- (See ticket https://github.com/haskell/process/issues/281)
+readCreateProcessWithExitCodeAndNice
+    :: CreateProcess
+    -> String                      -- ^ standard input
+    -> IO (ExitCode,String,String) -- ^ exitcode, stdout, stderr
+readCreateProcessWithExitCodeAndNice cp input = do
+    let cp_opts = cp {
+                    std_in  = CreatePipe,
+                    std_out = CreatePipe,
+                    std_err = CreatePipe
+                  }
+    withCreateProcess_ "readCreateProcessWithExitCode" cp_opts $
+      \mb_inh mb_outh mb_errh ph ->
+        case (mb_inh, mb_outh, mb_errh) of
+          (Just inh, Just outh, Just errh) -> do
+            ph `decreasePriorityBy` 10
+
+            out <- hGetContents outh
+            err <- hGetContents errh
+
+            -- fork off threads to start consuming stdout & stderr
+            withForkWait  (C.evaluate $ rnf out) $ \waitOut ->
+             withForkWait (C.evaluate $ rnf err) $ \waitErr -> do
+
+              -- now write any input
+              unless (null input) $
+                ignoreSigPipe $ hPutStr inh input
+              -- hClose performs implicit hFlush, and thus may trigger a SIGPIPE
+              ignoreSigPipe $ hClose inh
+
+              -- wait on the output
+              waitOut
+              waitErr
+
+              hClose outh
+              hClose errh
+
+            -- wait on the process
+            ex <- waitForProcess ph
+            return (ex, out, err)
+
+          (Nothing,_,_) -> error "readCreateProcessWithExitCode: Failed to get a stdin handle."
+          (_,Nothing,_) -> error "readCreateProcessWithExitCode: Failed to get a stdout handle."
+          (_,_,Nothing) -> error "readCreateProcessWithExitCode: Failed to get a stderr handle."
+
+
 -- | Prettify 'CmdSpec', so we can show the command to a user
 prettyCmdSpec :: CmdSpec -> String
 prettyCmdSpec (ShellCommand s) = s
@@ -1140,4 +1239,9 @@ loggedProc :: LogAction IO (WithSeverity Log) -> FilePath -> [String] -> IO Crea
 loggedProc l command args = do
   l <& LogProcessOutput (unwords $ "executing command:":command:args) `WithSeverity` Debug
   pure $ proc command args
- 
+
+-- | Decrease priority of another process by a given `nice` value. 
+--   Use positive priority for another process to yield CPU time.
+decreasePriorityBy pid prio = do
+  prevPrio <- getProcesPriority pid
+  setProcessPriority pid $ prevPrio + prio
