@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE CPP #-}
 module HIE.Bios.Cradle (
       findCradle
     , loadCradle
@@ -23,7 +24,9 @@ module HIE.Bios.Cradle (
   ) where
 
 import Control.Applicative ((<|>), optional)
+import qualified Control.Exception as C(evaluate)
 import Data.Bifunctor (first)
+import Data.ByteString(ByteString)
 import Control.DeepSeq
 import Control.Exception (handleJust)
 import qualified Data.Yaml as Yaml
@@ -41,6 +44,7 @@ import Data.Conduit.Process
 import qualified Data.Conduit.Combinators as C
 import qualified Data.Conduit as C
 import qualified Data.Conduit.Text as C
+import Data.Conduit(ConduitT)
 import qualified Data.HashMap.Strict as Map
 import Data.Maybe (fromMaybe, maybeToList)
 import Data.List
@@ -54,6 +58,7 @@ import System.Info.Extra (isWindows)
 import System.IO (hClose, hGetContents, hSetBuffering, BufferMode(LineBuffering), withFile, IOMode(..))
 import System.IO.Error (isPermissionError)
 import System.IO.Temp
+import Control.Monad.IO.Unlift(MonadUnliftIO(..))
 
 import HIE.Bios.Config
 import HIE.Bios.Environment (getCacheDir)
@@ -1110,7 +1115,7 @@ sourceProcessWithStreamsAndNice cp producerStdin consumerStdout consumerStderr =
      , (sourceStderr, closeStderr)
      , sph) <- streamingProcess cp
     -- Decrease process priority
-    sph `decreasePriorityBy` 10
+    decreaseProcessPriority sph
     (_, resStdout, resStderr) <-
       runConcurrently (
         (,,)
@@ -1186,7 +1191,7 @@ readCreateProcessWithExitCodeAndNice cp input = do
       \mb_inh mb_outh mb_errh ph ->
         case (mb_inh, mb_outh, mb_errh) of
           (Just inh, Just outh, Just errh) -> do
-            ph `decreasePriorityBy` 10
+            decreaseProcessPriority ph
 
             out <- hGetContents outh
             err <- hGetContents errh
@@ -1239,9 +1244,3 @@ loggedProc :: LogAction IO (WithSeverity Log) -> FilePath -> [String] -> IO Crea
 loggedProc l command args = do
   l <& LogProcessOutput (unwords $ "executing command:":command:args) `WithSeverity` Debug
   pure $ proc command args
-
--- | Decrease priority of another process by a given `nice` value. 
---   Use positive priority for another process to yield CPU time.
-decreasePriorityBy pid prio = do
-  prevPrio <- getProcesPriority pid
-  setProcessPriority pid $ prevPrio + prio
